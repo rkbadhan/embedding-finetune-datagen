@@ -140,21 +140,24 @@ def load_fineweb_documents(cfg: PipelineConfig) -> Iterator[dict]:
 def load_persona_hub(cfg: PipelineConfig) -> list[dict]:
     """
     Load persona descriptions from PersonaHub (Ge et al., 2024).
-    
+
     PersonaHub contains ~200k diverse persona descriptions, each representing
     a synthetic "user" with specific expertise, interests, and background.
-    
+
     Both Qwen3 and pplx-embed retrieve the top-5 most relevant personas for
     each document, then use them to diversify the synthetic queries. The idea
     is that a "marine biologist" would ask very different questions about an
     ocean document than a "high school student" would.
-    
-    Dataset structure:
-      - 'input persona': the persona description string
-      - 'synthesized text': example text the persona might produce
-      - 'description': additional context
-    
-    We use the 'input persona' field as the persona text to embed.
+
+    Dataset configs and their schemas:
+      "persona" config (200k rows):
+        - 'persona': the persona description string
+      "instruction", "math", "knowledge", "reasoning", "tool", "npc" configs:
+        - 'input_persona': the persona description string
+        - 'synthesized_text': example text the persona might produce
+        - 'description': additional context
+
+    We use the persona text field for embedding.
     """
     from datasets import load_dataset
 
@@ -166,22 +169,28 @@ def load_persona_hub(cfg: PipelineConfig) -> list[dict]:
         cfg.persona_dataset,
         cfg.persona_subset,
         split=cfg.persona_split,
+        streaming=True,  # Stream to avoid downloading full dataset into memory
     )
+
+    # Field name depends on the config subset:
+    #   "persona" config → 'persona'
+    #   all other configs → 'input_persona'
+    persona_field = "persona" if cfg.persona_subset == "persona" else "input_persona"
 
     personas = []
     for i, example in enumerate(ds):
-        if i >= cfg.persona_max_load:
+        if len(personas) >= cfg.persona_max_load:
             break
 
-        persona_text = example.get("input persona", "")
+        persona_text = example.get(persona_field, "")
         if not persona_text or len(persona_text.strip()) < 10:
             continue
 
         personas.append({
             "id": f"persona_{i}",
             "text": persona_text.strip(),
-            # Keep the synthesized text for potential downstream use
-            "synthesized_text": example.get("synthesized text", ""),
+            # These fields exist in non-persona configs (instruction, math, etc.)
+            "synthesized_text": example.get("synthesized_text", ""),
             "description": example.get("description", ""),
         })
 
@@ -405,52 +414,14 @@ def run_pipeline(cfg: PipelineConfig | None = None):
     doc_batch = []
     doc_meta_batch = []
     batch_size = 32  # process docs in mini-batches for efficiency
+    next_log_at = cfg.save_every  # track next progress log threshold
 
-    log.info("=" * 60)
-    log.info("Starting document processing...")
-    log.info("=" * 60)
-
-    t0 = time.time()
-
-    for doc in load_fineweb_documents(cfg):
-        doc_batch.append(doc["text"])
-        doc_meta_batch.append(doc)
-
-        if len(doc_batch) >= batch_size:
-            # Batch retrieve personas
-            batch_personas = retriever.retrieve_batch(doc_batch)
-
-            for meta, personas_for_doc in zip(doc_meta_batch, batch_personas):
-                result = {
-                    "document_id": meta["id"],
-                    "document_url": meta["url"],
-                    "document_text_preview": meta["text"][:500],  # preview only for output
-                    "document_word_count": len(meta["text"].split()),
-                    "top_5_personas": [
-                        {
-                            "persona_id": p["id"],
-                            "persona_text": p["text"],
-                            "similarity_score": round(p["similarity_score"], 4),
-                        }
-                        for p in personas_for_doc
-                    ],
-                }
-                results.append(result)
-
-            doc_batch = []
-            doc_meta_batch = []
-
-            # Progress logging
-            if len(results) % cfg.save_every == 0:
-                elapsed = time.time() - t0
-                rate = len(results) / elapsed
-                log.info(f"  Processed {len(results)} docs ({rate:.1f} docs/sec)")
-
-    # Process remaining docs in the last partial batch
-    if doc_batch:
-        batch_personas = retriever.retrieve_batch(doc_batch)
-        for meta, personas_for_doc in zip(doc_meta_batch, batch_personas):
-            result = {
+    def _process_batch(doc_texts, doc_metas):
+        """Retrieve personas for a batch and format results."""
+        batch_personas = retriever.retrieve_batch(doc_texts)
+        batch_results = []
+        for meta, personas_for_doc in zip(doc_metas, batch_personas):
+            batch_results.append({
                 "document_id": meta["id"],
                 "document_url": meta["url"],
                 "document_text_preview": meta["text"][:500],
@@ -463,13 +434,40 @@ def run_pipeline(cfg: PipelineConfig | None = None):
                     }
                     for p in personas_for_doc
                 ],
-            }
-            results.append(result)
+            })
+        return batch_results
+
+    log.info("=" * 60)
+    log.info("Starting document processing...")
+    log.info("=" * 60)
+
+    t0 = time.time()
+
+    for doc in load_fineweb_documents(cfg):
+        doc_batch.append(doc["text"])
+        doc_meta_batch.append(doc)
+
+        if len(doc_batch) >= batch_size:
+            results.extend(_process_batch(doc_batch, doc_meta_batch))
+            doc_batch = []
+            doc_meta_batch = []
+
+            # Progress logging (threshold-based to work with any batch size)
+            if len(results) >= next_log_at:
+                elapsed = time.time() - t0
+                rate = len(results) / elapsed if elapsed > 0 else 0
+                log.info(f"  Processed {len(results)} docs ({rate:.1f} docs/sec)")
+                next_log_at += cfg.save_every
+
+    # Process remaining docs in the last partial batch
+    if doc_batch:
+        results.extend(_process_batch(doc_batch, doc_meta_batch))
 
     total_time = time.time() - t0
     log.info("=" * 60)
     log.info(f"Pipeline complete: {len(results)} documents processed in {total_time:.1f}s")
-    log.info(f"  Average: {len(results)/total_time:.1f} docs/sec")
+    if total_time > 0:
+        log.info(f"  Average: {len(results)/total_time:.1f} docs/sec")
     log.info("=" * 60)
 
     # --- Save results ---
