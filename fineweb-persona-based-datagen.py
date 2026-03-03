@@ -140,21 +140,24 @@ def load_fineweb_documents(cfg: PipelineConfig) -> Iterator[dict]:
 def load_persona_hub(cfg: PipelineConfig) -> list[dict]:
     """
     Load persona descriptions from PersonaHub (Ge et al., 2024).
-    
+
     PersonaHub contains ~200k diverse persona descriptions, each representing
     a synthetic "user" with specific expertise, interests, and background.
-    
+
     Both Qwen3 and pplx-embed retrieve the top-5 most relevant personas for
     each document, then use them to diversify the synthetic queries. The idea
     is that a "marine biologist" would ask very different questions about an
     ocean document than a "high school student" would.
-    
-    Dataset structure:
-      - 'input persona': the persona description string
-      - 'synthesized text': example text the persona might produce
-      - 'description': additional context
-    
-    We use the 'input persona' field as the persona text to embed.
+
+    Dataset configs and their schemas:
+      "persona" config (200k rows):
+        - 'persona': the persona description string
+      "instruction", "math", "knowledge", "reasoning", "tool", "npc" configs:
+        - 'input_persona': the persona description string
+        - 'synthesized_text': example text the persona might produce
+        - 'description': additional context
+
+    We use the persona text field for embedding.
     """
     from datasets import load_dataset
 
@@ -169,20 +172,25 @@ def load_persona_hub(cfg: PipelineConfig) -> list[dict]:
         streaming=True,  # Stream to avoid downloading full dataset into memory
     )
 
+    # Field name depends on the config subset:
+    #   "persona" config → 'persona'
+    #   all other configs → 'input_persona'
+    persona_field = "persona" if cfg.persona_subset == "persona" else "input_persona"
+
     personas = []
     for i, example in enumerate(ds):
         if len(personas) >= cfg.persona_max_load:
             break
 
-        persona_text = example.get("input persona", "")
+        persona_text = example.get(persona_field, "")
         if not persona_text or len(persona_text.strip()) < 10:
             continue
 
         personas.append({
             "id": f"persona_{i}",
             "text": persona_text.strip(),
-            # Keep the synthesized text for potential downstream use
-            "synthesized_text": example.get("synthesized text", ""),
+            # These fields exist in non-persona configs (instruction, math, etc.)
+            "synthesized_text": example.get("synthesized_text", ""),
             "description": example.get("description", ""),
         })
 
