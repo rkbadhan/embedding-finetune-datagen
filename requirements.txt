@@ -1,0 +1,14 @@
+# Synthetic Data Generation Pipeline - Dependencies
+# Install: pip install -r requirements.txt
+
+# Core data loading
+datasets>=2.16.0
+huggingface-hub>=0.20.0
+
+# Embedding + retrieval
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4          # use faiss-gpu if you have CUDA
+
+# Standard
+numpy>=1.24.0
+tqdm>=4.65.0
