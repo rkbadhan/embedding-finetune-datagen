@@ -23,6 +23,12 @@ References:
   - pplx-embed paper: arXiv:2602.11151v2
 """
 
+import os
+# Disable tokenizers parallelism before any HuggingFace imports.
+# The Rust-based tokenizers thread pool conflicts with Python multiprocessing
+# (used by `datasets` streaming), causing segfaults and leaked semaphores.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import json
 import time
 import logging
@@ -419,6 +425,12 @@ def run_pipeline(cfg: PipelineConfig | None = None):
     retriever.build_index(personas)
 
     # --- Process documents ---
+    # Materialize all documents upfront so the streaming dataset and its
+    # multiprocessing workers are fully closed before we call model.encode().
+    # Interleaving streaming iteration with encode() causes segfaults because
+    # the datasets workers fork *after* tokenizers' Rust thread pool is alive.
+    documents = list(load_fineweb_documents(cfg))
+
     results = []
     doc_batch = []
     doc_meta_batch = []
@@ -452,7 +464,7 @@ def run_pipeline(cfg: PipelineConfig | None = None):
 
     t0 = time.time()
 
-    for doc in load_fineweb_documents(cfg):
+    for doc in documents:
         doc_batch.append(doc["text"])
         doc_meta_batch.append(doc)
 
