@@ -55,11 +55,13 @@ class PipelineConfig:
     persona_max_load: int = 50_000         # cap for dev; full set is ~200k
 
     # -- Embedding model for persona retrieval --
-    # Using a small, fast model for the ANN index.
-    # In production, Qwen3/pplx used their own retrieval models.
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_batch_size: int = 256
-    embedding_dim: int = 384               # matches all-MiniLM-L6-v2
+    # Nomic Embed v1.5: strong open-source model with Matryoshka support.
+    # Requires task-instruction prefixes on all inputs.
+    embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
+    embedding_batch_size: int = 64
+    embedding_dim: int = 768               # nomic-embed-text-v1.5 full dimension
+    embedding_prefix_document: str = "search_document: "  # prefix for indexed texts
+    embedding_prefix_query: str = "search_query: "        # prefix for query texts
 
     # -- Retrieval --
     top_k_personas: int = 5                # papers specify top-5
@@ -215,9 +217,10 @@ class PersonaRetriever:
     2. For each incoming document, we embed it with the same model and
        query the index for top-5 nearest personas.
     
-    3. The embedding model here (all-MiniLM-L6-v2) is a lightweight choice
-       for learning purposes. In production, Qwen3 used their own retrieval
-       model, and pplx-embed likely used a similar internal model.
+    3. The embedding model here (nomic-embed-text-v1.5) is a strong open-source
+       model with 768-dim embeddings and Matryoshka dimension support.
+       It requires task-instruction prefixes on all inputs (search_document:,
+       search_query:, clustering:, classification:).
     
     Why FAISS IVF instead of brute-force?
     - With 200k personas, brute-force is fast enough (<10ms per query).
@@ -238,7 +241,9 @@ class PersonaRetriever:
         from sentence_transformers import SentenceTransformer
 
         log.info(f"Loading embedding model: {self.cfg.embedding_model}")
-        self.model = SentenceTransformer(self.cfg.embedding_model)
+        self.model = SentenceTransformer(
+            self.cfg.embedding_model, trust_remote_code=True
+        )
         log.info(f"  Embedding dimension: {self.model.get_sentence_embedding_dimension()}")
 
     def build_index(self, personas: list[dict]):
@@ -255,7 +260,8 @@ class PersonaRetriever:
         import faiss
 
         self.personas = personas
-        persona_texts = [p["text"] for p in personas]
+        prefix = self.cfg.embedding_prefix_document
+        persona_texts = [prefix + p["text"] for p in personas]
 
         log.info(f"Encoding {len(persona_texts)} personas...")
         t0 = time.time()
@@ -315,9 +321,10 @@ class PersonaRetriever:
         if top_k is None:
             top_k = self.cfg.top_k_personas
 
-        # Encode the document
+        # Encode the document (as a query to search the persona index)
+        query = self.cfg.embedding_prefix_query + document_text
         doc_embedding = self.model.encode(
-            [document_text],
+            [query],
             normalize_embeddings=True,
         ).astype(np.float32)
 
@@ -345,9 +352,11 @@ class PersonaRetriever:
         if top_k is None:
             top_k = self.cfg.top_k_personas
 
-        # Batch encode all documents
+        # Batch encode all documents (as queries to search the persona index)
+        prefix = self.cfg.embedding_prefix_query
+        prefixed_docs = [prefix + d for d in documents]
         doc_embeddings = self.model.encode(
-            documents,
+            prefixed_docs,
             batch_size=self.cfg.embedding_batch_size,
             normalize_embeddings=True,
         ).astype(np.float32)
