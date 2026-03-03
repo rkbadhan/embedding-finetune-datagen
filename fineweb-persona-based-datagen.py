@@ -166,11 +166,12 @@ def load_persona_hub(cfg: PipelineConfig) -> list[dict]:
         cfg.persona_dataset,
         cfg.persona_subset,
         split=cfg.persona_split,
+        streaming=True,  # Stream to avoid downloading full dataset into memory
     )
 
     personas = []
     for i, example in enumerate(ds):
-        if i >= cfg.persona_max_load:
+        if len(personas) >= cfg.persona_max_load:
             break
 
         persona_text = example.get("input persona", "")
@@ -405,52 +406,14 @@ def run_pipeline(cfg: PipelineConfig | None = None):
     doc_batch = []
     doc_meta_batch = []
     batch_size = 32  # process docs in mini-batches for efficiency
+    next_log_at = cfg.save_every  # track next progress log threshold
 
-    log.info("=" * 60)
-    log.info("Starting document processing...")
-    log.info("=" * 60)
-
-    t0 = time.time()
-
-    for doc in load_fineweb_documents(cfg):
-        doc_batch.append(doc["text"])
-        doc_meta_batch.append(doc)
-
-        if len(doc_batch) >= batch_size:
-            # Batch retrieve personas
-            batch_personas = retriever.retrieve_batch(doc_batch)
-
-            for meta, personas_for_doc in zip(doc_meta_batch, batch_personas):
-                result = {
-                    "document_id": meta["id"],
-                    "document_url": meta["url"],
-                    "document_text_preview": meta["text"][:500],  # preview only for output
-                    "document_word_count": len(meta["text"].split()),
-                    "top_5_personas": [
-                        {
-                            "persona_id": p["id"],
-                            "persona_text": p["text"],
-                            "similarity_score": round(p["similarity_score"], 4),
-                        }
-                        for p in personas_for_doc
-                    ],
-                }
-                results.append(result)
-
-            doc_batch = []
-            doc_meta_batch = []
-
-            # Progress logging
-            if len(results) % cfg.save_every == 0:
-                elapsed = time.time() - t0
-                rate = len(results) / elapsed
-                log.info(f"  Processed {len(results)} docs ({rate:.1f} docs/sec)")
-
-    # Process remaining docs in the last partial batch
-    if doc_batch:
-        batch_personas = retriever.retrieve_batch(doc_batch)
-        for meta, personas_for_doc in zip(doc_meta_batch, batch_personas):
-            result = {
+    def _process_batch(doc_texts, doc_metas):
+        """Retrieve personas for a batch and format results."""
+        batch_personas = retriever.retrieve_batch(doc_texts)
+        batch_results = []
+        for meta, personas_for_doc in zip(doc_metas, batch_personas):
+            batch_results.append({
                 "document_id": meta["id"],
                 "document_url": meta["url"],
                 "document_text_preview": meta["text"][:500],
@@ -463,13 +426,40 @@ def run_pipeline(cfg: PipelineConfig | None = None):
                     }
                     for p in personas_for_doc
                 ],
-            }
-            results.append(result)
+            })
+        return batch_results
+
+    log.info("=" * 60)
+    log.info("Starting document processing...")
+    log.info("=" * 60)
+
+    t0 = time.time()
+
+    for doc in load_fineweb_documents(cfg):
+        doc_batch.append(doc["text"])
+        doc_meta_batch.append(doc)
+
+        if len(doc_batch) >= batch_size:
+            results.extend(_process_batch(doc_batch, doc_meta_batch))
+            doc_batch = []
+            doc_meta_batch = []
+
+            # Progress logging (threshold-based to work with any batch size)
+            if len(results) >= next_log_at:
+                elapsed = time.time() - t0
+                rate = len(results) / elapsed if elapsed > 0 else 0
+                log.info(f"  Processed {len(results)} docs ({rate:.1f} docs/sec)")
+                next_log_at += cfg.save_every
+
+    # Process remaining docs in the last partial batch
+    if doc_batch:
+        results.extend(_process_batch(doc_batch, doc_meta_batch))
 
     total_time = time.time() - t0
     log.info("=" * 60)
     log.info(f"Pipeline complete: {len(results)} documents processed in {total_time:.1f}s")
-    log.info(f"  Average: {len(results)/total_time:.1f} docs/sec")
+    if total_time > 0:
+        log.info(f"  Average: {len(results)/total_time:.1f} docs/sec")
     log.info("=" * 60)
 
     # --- Save results ---
