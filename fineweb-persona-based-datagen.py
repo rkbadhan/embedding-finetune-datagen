@@ -279,7 +279,21 @@ class PersonaRetriever:
             show_progress_bar=True,
             normalize_embeddings=True,  # L2-normalize for cosine similarity
         )
-        self._persona_embeddings = np.array(embeddings, dtype=np.float32)
+        # FAISS requires C-contiguous float32 arrays. np.ascontiguousarray
+        # guarantees the memory layout; np.array() alone does not.
+        self._persona_embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
+
+        # MPS and some backends can produce NaN/Inf values which cause FAISS
+        # to segfault during k-means training (no internal validation).
+        if not np.all(np.isfinite(self._persona_embeddings)):
+            n_bad = int(np.sum(~np.isfinite(self._persona_embeddings)))
+            log.warning(f"Found {n_bad} non-finite values in embeddings, replacing with zeros")
+            self._persona_embeddings = np.nan_to_num(self._persona_embeddings)
+            norms = np.linalg.norm(self._persona_embeddings, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-8)
+            self._persona_embeddings = np.ascontiguousarray(
+                self._persona_embeddings / norms, dtype=np.float32
+            )
 
         elapsed = time.time() - t0
         log.info(f"  Encoded in {elapsed:.1f}s "
@@ -298,8 +312,14 @@ class PersonaRetriever:
             nlist = min(self.cfg.faiss_nlist, n_personas // 10)
             log.info(f"  Building IVF index: {nlist} clusters, dim={dim}")
 
-            quantizer = faiss.IndexFlatIP(dim)
-            self.index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            # Store quantizer as instance variable to prevent garbage collection.
+            # FAISS C++ holds a raw pointer to the quantizer; if Python GC
+            # collects the wrapper, train()/search() follow a dangling pointer
+            # and segfault.
+            self._quantizer = faiss.IndexFlatIP(dim)
+            self.index = faiss.IndexIVFFlat(
+                self._quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT
+            )
             self.index.nprobe = self.cfg.faiss_nprobe
 
             # IVF requires training on the data distribution
